@@ -1,0 +1,47 @@
+{
+  "compilerOptions": {
+    // ── Módulos ─────────────────────────────────────────────────────────────
+    "module": "CommonJS",
+    "moduleResolution": "node",
+
+    "target": "ES2022",
+
+    // ── Compilación ──────────────────────────────────────────────────────────
+    "declaration": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    "removeComments": true,
+    "incremental": true,
+
+    // ── Decoradores (REQUERIDO por NestJS) ───────────────────────────────────
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+
+    // ── Strict mode ──────────────────────────────────────────────────────────
+    "strict": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "strictBindCallApply": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+
+    // ── Interoperabilidad de módulos ───────────────────────────────────────
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+
+    // ── Varios ───────────────────────────────────────────────────────────────
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+
+    // ── Path aliases (deben coincidir con nest-cli.json) ──────────────────────
+    "paths": {
+      "@modules/*": ["./src/modules/*"],
+      "@shared/*": ["./src/shared/*"],
+      "@config/*": ["./src/config/*"],
+      "@common/*": ["./src/common/*"],
+      "@health/*": ["./src/health/*"]
+    }
+  }
+}

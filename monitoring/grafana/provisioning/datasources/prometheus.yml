@@ -1,0 +1,13 @@
+# filepath: monitoring/grafana/provisioning/datasources/prometheus.yml
+# Configura automáticamente la conexión de Grafana con Prometheus
+# Se aplica cuando Grafana arranca por primera vez
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: "30s"

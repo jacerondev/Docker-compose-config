@@ -1,0 +1,19 @@
+# filepath: reports/.dockerignore
+
+# .dockerignore example for all services
+node_modules
+.git
+.env
+*.log
+logs
+dist
+.next
+__pycache__
+*.pyc
+venv
+/.venv
+*.sqlite
+*.db
+coverage
+npm-debug.log
+yarn-error.log

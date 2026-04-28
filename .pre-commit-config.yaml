@@ -1,0 +1,54 @@
+# filepath: .pre-commit-config.yaml
+
+repos:
+  # Detectar secrets hardcodeados antes del commit
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.2
+    hooks:
+      - id: gitleaks
+
+  # Python: linting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.3.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^reports/
+
+  # TypeScript/JS: ESLint vía make lint (más flexible que plugin directo)
+  - repo: local
+    hooks:
+      - id: eslint-backend
+        name: ESLint Backend
+        language: system
+        entry: bash -c 'cd backend && pnpm run lint'
+        files: ^backend/src/.*\.(ts|js)$
+        pass_filenames: false
+
+  # Validar .env antes de push a main (solo en main)
+  - repo: local
+    hooks:
+      - id: validate-env-before-push
+        name: Validate .env before push to main
+        language: system
+        entry: bash -c 'BRANCH=$(git rev-parse --abbrev-ref HEAD); [ "$BRANCH" = "main" ] && make validate-env || true'
+        stages: [pre-push]
+        pass_filenames: false
+
+  # Bandit para Python
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.8
+    hooks:
+      - id: bandit
+        args: [-r, reports/src/, -ll]
+        files: ^reports/src/
+
+  # Verificar que no se suben archivos .env reales
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: end-of-file-fixer
+      - id: trailing-whitespace

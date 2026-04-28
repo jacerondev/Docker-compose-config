@@ -1,0 +1,12 @@
+// {
+//   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+//   "extends": ["config:recommended"],
+//   "schedule": ["every weekend"],  // Solo crea PRs los fines de semana
+//   "packageRules": [
+//     {
+//       "matchManagers": ["dockerfile", "docker-compose", "github-actions"],
+//       "automerge": false,          // Crea el PR pero NO mergea solo
+//       "labels": ["dependencies", "docker"]
+//     }
+//   ]
+// }

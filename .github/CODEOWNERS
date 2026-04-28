@@ -1,0 +1,18 @@
+# .github/CODEOWNERS
+# ── Propietario global ──────────────────────
+*                          @tu-usuario-github
+
+# ── Servicios ───────────────────────────────
+/backend/                  @tu-usuario-github
+/frontend/                 @tu-usuario-github
+/reports/                  @tu-usuario-github
+
+# ── Infraestructura ─────────────────────────
+/docker-compose*.yml       @tu-usuario-github
+/.github/                  @tu-usuario-github
+/scripts/                  @tu-usuario-github
+/monitoring/               @tu-usuario-github
+
+# ── Seguridad (revisión obligatoria) ────────
+/secrets/                  @tu-usuario-github
+SECURITY.md                @tu-usuario-github

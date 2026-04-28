@@ -1,0 +1,14 @@
+# filepath: monitoring/alertmanager.yml
+route:
+  receiver: 'slack-devops'
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: 'slack-devops'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#devops-alerts'
+        title: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+        send_resolved: true

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["every weekend"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Actualizar imágenes Docker con PR manual (no automerge — revisar SHA256)",
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "automerge": false,
+      "labels": ["dependencies", "docker"],
+      "reviewers": ["tu-usuario-github"]
+    },
+    {
+      "description": "GitHub Actions — no automerge, verificar cambios de comportamiento",
+      "matchManagers": ["github-actions"],
+      "automerge": false,
+      "labels": ["dependencies", "ci"]
+    },
+    {
+      "description": "Dependencias de producción Node.js — PR manual, tests deben pasar",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["dependencies"],
+      "automerge": false,
+      "labels": ["dependencies", "node"]
+    },
+    {
+      "description": "DevDependencies Node.js — automerge si CI pasa",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["devDependencies"],
+      "automerge": true,
+      "automergeType": "pr",
+      "labels": ["dependencies", "node", "dev"]
+    },
+    {
+      "description": "Dependencias Python — PR manual",
+      "matchManagers": ["pip_requirements"],
+      "automerge": false,
+      "labels": ["dependencies", "python"]
+    }
+  ]
+}

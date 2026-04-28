@@ -1,0 +1,180 @@
+# filepath: docker-compose.monitoring.yml
+# docker-compose.monitoring.yml
+# ══════════════════════════════════════════════════════════════════════════════
+# Stack de monitoreo: Prometheus + Grafana + exporters
+#
+# PUERTOS CONFIGURABLES via .env (añadir a .env.example):
+#   PORT_PROMETHEUS=9090
+#   PORT_GRAFANA=3001
+#   PORT_NODE_EXPORTER=9100
+#   PORT_CADVISOR=8080
+#
+# USO:
+#   make monitoring-up    ← levanta este stack
+#   make monitoring-down  ← detiene este stack
+#   make monitoring-logs  ← ver logs
+#
+# NO incluir en docker-compose.prod.yml — es un stack separado y opcional.
+# Levantarlo en cualquier momento sin afectar los servicios principales.
+#
+# PREREQUISITO:
+#   echo "tu_password_grafana" > secrets/grafana_password.txt
+#   chmod 600 secrets/grafana_password.txt
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Secretos ──────────────────────────────────────────────────────────────────
+secrets:
+  grafana_password:
+    file: ./secrets/grafana_password.txt # Contraseña de admin para Grafana (usado solo en el servicio de Grafana)
+  slack_webhook_url:                      
+    file: ./secrets/slack_webhook_url.txt # URL del webhook de Slack para notificaciones (usado en backend y reports)
+
+# ─── Servicios ───────────────────────────────────────────────────────────────
+services:
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # PROMETHEUS
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # ── recolecta métricas cada 30s ────────────────────────────────
+  # Scrapea /metrics de: backend (NestJS), reports (Flask), node-exporter, cadvisor
+  prometheus:
+    image: prom/prometheus:v2.50.1@sha256:e3bdd6a5f24fdf6e22ee7c8c3c7e97e7a5f57c1f24ded43b12c6b37f08f2bfad
+    container_name: nombre_del_proyecto_prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'    # conservar 30 días de métricas
+      - '--web.enable-lifecycle'                # permite reload sin reiniciar
+    ports:
+      # Puerto configurable via .env — default 9090
+      # Solo localhost: acceder via Nginx si se quiere exponer al exterior
+      - "127.0.0.1:${PORT_PROMETHEUS:-9090}:9090"
+    extra_hosts:
+      # host-gateway resuelve a la IP del host Docker
+      # Necesario para que Prometheus pueda scrapear backend:4000 y reports:5000
+      - "host-gateway:host-gateway"
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # GRAFANA
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # ── dashboards visuales ──────────────────────────────────────────
+  # Acceder en: http://localhost:${PORT_GRAFANA:-3001}
+  # Usuario: admin / contraseña: ver secrets/grafana_password.txt
+  grafana:
+    image: grafana/grafana:10.3.3@sha256:1ebb3d16e54b56a5f9be56cf6f5e81f27f3e9b69a4ed81af97cf99e394562c4e
+    container_name: nombre_del_proyecto_grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD_FILE=/run/secrets/grafana_password
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:${PORT_GRAFANA:-3001}
+      # Deshabilitar telemetría de Grafana
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Provisioning automático: datasource Prometheus + dashboards
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      # Puerto configurable via .env — default 3001
+      # (3000 ya lo usa el frontend de NOMBRE_DEL_PROYECTO)
+      - "127.0.0.1:${PORT_GRAFANA:-3001}:3000"
+    secrets:
+      - grafana_password
+    networks:
+      - monitoring
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # NODE EXPORTER
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # ── métricas del servidor host (CPU, RAM, disco, red) ───────
+  node-exporter:
+    image: prom/node-exporter:v1.7.0@sha256:4cb2b9019f1757be8482419002cb7afe028fdba35d47958829e4cfeaf6246d80
+    container_name: nombre_del_proyecto_node_exporter
+    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      # Excluir filesystems del sistema para reducir ruido
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    # No exponer puerto directamente — Prometheus lo scrapea internamente
+    networks:
+      - monitoring
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # CADVISOR (cAdvisor)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # ── métricas de contenedores Docker ─────────────────────────────
+  # Muestra CPU/RAM/red por cada contenedor Docker (nombre_del_proyecto_api, nombre_del_proyecto_web, etc.)
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1@sha256:b3e8f6349e57e4cedc7e3f98f28a8de0f9b00e5427c9c8d50c7da42e3de3ab58
+    container_name: nombre_del_proyecto_cadvisor
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    # No exponer puerto directamente — Prometheus lo scrapea internamente
+    networks:
+      - monitoring
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0@sha256:e13b6ed5cb929eeaee733479dce55e10eb3bc2e9c4586c705a4e8da41e5eacf5
+    container_name: nombre_del_proyecto_alertmanager
+    restart: unless-stopped
+    profiles:
+    - prod-alerting    # Solo se levanta con: --profile prod-alerting
+    volumes:
+      - ./monitoring/alertmanager.yml.template:/etc/alertmanager/alertmanager.yml.template:ro
+    entrypoint: >
+      sh -c "
+        export SLACK_WEBHOOK_URL=$$(cat /run/secrets/slack_webhook_url) &&
+        envsubst < /etc/alertmanager/alertmanager.yml.template > /tmp/alertmanager.yml &&
+        /bin/alertmanager --config.file=/tmp/alertmanager.yml
+      "
+    ports:
+      - "127.0.0.1:9093:9093"
+    secrets:
+      - slack_webhook_url
+    environment:
+      SLACK_WEBHOOK_URL_FILE: /run/secrets/slack_webhook_url
+    networks:
+      - monitoring
+
+# ── Volúmenes persistentes ────────────────────────────────────────────────────
+volumes:
+  prometheus_data:   # métricas de Prometheus (30 días)
+  grafana_data:      # dashboards y configuración de Grafana
+
+# ── Red aislada de monitoreo ─────────────────────────────────────────────────
+networks:
+  monitoring:
+    driver: bridge

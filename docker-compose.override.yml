@@ -1,0 +1,217 @@
+# filepath: docker-compose.override.yml
+# ══════════════════════════════════════════════════════════════════════════════
+# docker-compose.override.yml — DELTA para DESARROLLO LOCAL
+#
+# ¿Cómo funciona?
+#   docker compose up
+#   └── lee: docker-compose.yml      (configuración base — los 3 servicios)
+#   └── auto-aplica: este archivo    (sobreescribe/añade solo lo de dev)
+#
+# Este archivo SOLO define lo que es DIFERENTE en desarrollo vs base.
+# Lo que está en docker-compose.yml se hereda automáticamente.
+#
+# Para producción:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up
+#   (este override NO se aplica en producción)
+#
+# Lo que NO incluimos aquí (y por qué):
+#   - restart:          No queremos restart automático en dev (queremos ver los errores)
+#   - read_only:        En dev el contenedor necesita escribir (hot reload, logs)
+#   - mem_limit/cpus:   En dev no limitamos recursos para desarrollo libre
+#   - secrets:          En dev se usan env vars directamente (ver docker-compose.yml)
+#   - extra_hosts:      No necesario en dev — los puertos están expuestos directamente
+# ══════════════════════════════════════════════════════════════════════════════
+
+services:
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # BASE DE DATOS — Postgresql
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  postgres:
+    # 1. RED — Puertos accesibles desde cualquier interfaz (0.0.0.0)
+    #    En producción están restringidos a 127.0.0.1 (solo Nginx)
+    ports:
+      - "127.0.0.1:5432:5432"           # Accesible desde DBeaver/DataGrip localmente
+
+    # 2. IMAGEN
+    image: postgres:17-alpine
+
+    # 3. NOMBRE DEL CONTENEDOR
+    container_name: nombre_del_proyecto_db_dev
+
+    # 4. VARIABLES ADICIONALES de desarrollo
+    environment:
+      POSTGRES_USER: ${DB_USER:-user_dev}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password_dev}
+      POSTGRES_DB: ${DB_NAME:-nombre_del_proyecto_db}
+      # Pasar las vars del usuario readonly al script de init
+      DB_READ_ONLY_USER: ${DB_READ_ONLY_USER:-user_dev_readonly}
+      DB_READ_ONLY_PASSWORD: ${DB_READ_ONLY_PASSWORD:-password_dev_readonly}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+
+    # 5. VOLUMENES
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./config/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+
+    command: postgres -c hba_file=/etc/postgresql/pg_hba.conf
+
+    # 6. SALUD
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-user_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    # 7. REDES
+    networks:
+      - nombre_del_proyecto-private  # Añadir para consistencia con el resto
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # BACKEND — NestJS
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  backend:
+    # 1. RED — Puertos accesibles desde cualquier interfaz (0.0.0.0)
+    #    En producción están restringidos a 127.0.0.1 (solo Nginx)
+    ports:
+      - "127.0.0.1:${PORT_BACKEND}:${PORT_BACKEND}"
+      - "127.0.0.1:${PORT_DEBUG_BACKEND:-9229}:9229"  # Puerto de debug de Node.js (opcional)
+                     # Uso: node --inspect=0.0.0.0:9229
+                     # Conectar con Chrome DevTools o VS Code debugger
+
+    # 2. VOLÚMENES — Hot reload: sincroniza código local con el contenedor
+    volumes:
+      # Bind mount: cambios locales se reflejan inmediatamente en el contenedor
+      - ./backend:/usr/src/app:delegated
+      # Volume nombrado: aísla node_modules del contenedor del host
+      # Sin esto, los módulos del contenedor se mezclarían con los de tu PC
+      - backend_node_modules:/usr/src/app/node_modules
+
+    # 3. COMANDO — Modo watch de NestJS (recompila al detectar cambios)
+    command: pnpm run start:dev
+
+    # 4. VARIABLES ADICIONALES de desarrollo
+    environment:
+      - LOG_LEVEL=debug   # Más logs en desarrollo
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - NESTJS_AUTH_URL=${NESTJS_AUTH_URL:-http://backend:4000}
+      # En producción, METRICS_PASSWORD viene de Docker Secrets (METRICS_PASSWORD_FILE).
+      # En desarrollo, viene directamente del .env (no hay Docker Secrets en dev).
+      - METRICS_PASSWORD=${METRICS_PASSWORD:-prometheus}
+      # En producción, JWT_SECRET viene de Docker Secrets (JWT_SECRET_FILE).
+      # En desarrollo, viene directamente del .env (no hay Docker Secrets en dev).
+      - JWT_SECRET=${JWT_SECRET:-CAMBIAR_JWT_SECRET_EN_DEV}  # ← Solo para el script de init-db.sh, no usado por el backend en dev (usa .env)
+
+    # 5. LOGS — Menos retención en dev (menor footprint en disco)
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    
+    # 6. DEPENDS — Espera al healthcheck de la DB
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # NOTA: healthcheck más rápido en dev (opcional — descomenta si quieres
+    # que los servicios estén "healthy" más rápido para tests locales):
+    # healthcheck:
+    #   interval: 15s
+    #   start_period: 20s
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # FRONTEND — Next.js
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  frontend:
+    # 1. RED
+    ports:
+      - "127.0.0.1:${PORT_FRONTEND}:${PORT_FRONTEND}"
+
+    # 2. VOLÚMENES — Hot reload de Next.js
+    volumes:
+      - ./frontend:/usr/src/app:delegated
+      - frontend_node_modules:/usr/src/app/node_modules
+      # Caché de Next.js persistente entre reinicios del contenedor:
+      # Sin esto, cada `make dev` recompila todo desde cero (~30s extra)
+      - frontend_next:/usr/src/app/.next
+
+    # 3. VARIABLES ADICIONALES
+    environment:
+      # Habilitar polling para hot reload en sistemas de archivos que no
+      # soportan inotify correctamente (WSL2, algunos NFS, VirtualBox):
+      # Descomentar si los cambios no se detectan automáticamente.
+      # - WATCHPACK_POLLING=true
+
+      # Activar modo debug de Next.js (más logs internos del framework):
+      # - NODE_OPTIONS=--inspect=0.0.0.0:9228
+
+    # 4. LOGS
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # REPORTS API — Python/Flask
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  reports-api:
+    # 1. RED
+    ports:
+      - "127.0.0.1:${PORT_REPORTS}:${PORT_REPORTS}"
+      # Puerto de debug Python (debugpy) — opcional
+      # Descomenta y conecta con VS Code Python Debugger:
+      # - "5678:5678"
+
+    # 2. VOLÚMENES — Hot reload de Flask
+    volumes:
+      - ./reports:/app:delegated
+      # Caché de Python compilado (*.pyc) — evita recompilación en cada restart
+      - reports_pycache:/app/__pycache__
+
+    # 3. COMANDO — Flask en modo debug (autoreload al detectar cambios .py)
+    command: python main.py
+    # Alternativa con debugpy para debugging interactivo:
+    # command: python -m debugpy --listen 0.0.0.0:5678 --wait-for-client main.py
+    # APP_ENV=development ya activa el hot-reload de Flask automáticamente.
+
+    # 4. VARIABLES ADICIONALES de desarrollo
+    environment:
+      - DB_PASSWORD=${DB_READ_ONLY_PASSWORD}
+      - DB_USER=${DB_READ_ONLY_USER}
+      - FLASK_APP=main.py
+      - FLASK_DEBUG=1
+      - NESTJS_AUTH_URL=${NESTJS_AUTH_URL:-http://backend:4000}
+
+    # 4. LOGS — Más espacio para reports (genera más logs de procesamiento)
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 5. DEPENDS — Espera al healthcheck de la DB
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# # ─── Redes ───────────────────────────────────────────────────────────────────
+# networks:
+#   # Red interna: comunicacion entre servicios
+#   nombre_del_proyecto-private:
+#     driver: bridge
+#     internal: true          # Sin acceso a internet — aislada completamente
+#     name: nombre_del_proyecto-private   # Nombre explícito
+
+# ─── Volúmenes nombrados ─────────────────────────────────────────────────────
+# Docker los crea automáticamente la primera vez.
+# Para resetearlos (limpiar node_modules o caché):
+#   docker compose down -v   ← elimina todos los volúmenes de este compose
+volumes:
+  postgres_dev_data:      # Base de datos para desarrollo
+  backend_node_modules:   # node_modules del backend aislados del host
+  frontend_node_modules:  # node_modules del frontend aislados del host
+  frontend_next:          # Caché de compilación de Next.js
+  reports_pycache:        # Bytecode compilado de Python

@@ -1,0 +1,113 @@
+# filepath: docker-compose.yml
+# ARCHIVO DE CONFIGURACIÓN DE DOCKER COMPOSE PARA TODO EL PROYECTO
+#
+# ESTRUCTURA DE CAPAS:
+#   docker-compose.yml            ← BASE: solo lo que es común a todos los entornos
+#   docker-compose.override.yml   ← DEV:  sobreescribe/añade configuración de desarrollo
+#   docker-compose.prod.yml       ← PROD: sobreescribe/añade configuración de producción
+#   docker-compose.monitoring.yml ← MONITORING: servicios de monitoreo para ambos entornos
+#
+# NOTA IMPORTANTE — depends_on y base de datos:
+#   Este archivo base NO incluye `depends_on` hacia PostgreSQL ni un servicio `postgres`.
+#   Motivo: en producción, PostgreSQL corre en el HOST (fuera de Docker), no como contenedor.
+#           En desarrollo, el contenedor `postgres` y el `depends_on` se añaden
+#           automáticamente mediante docker-compose.override.yml.
+#   Si ejecutas solo `docker compose up` (sin override) en dev, los servicios
+#   intentarán conectarse a la DB antes de que esté lista. Siempre usa `make dev`.
+#   Ver DECISIONS.md ADR-006 para la justificación de PostgreSQL en el host.
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: .docker/Dockerfile
+      args:
+        PORT_BACKEND: ${PORT_BACKEND:-4000}  # ← Pasa variable al build
+        PNPM_VERSION: ${PNPM_VERSION:-10.32.1}
+    container_name: nombre_del_proyecto_api
+    environment:
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_NAME=${DB_NAME:-nombre_del_proyecto_db}
+      - PORT=${PORT_BACKEND}
+      - NODE_ENV=${NODE_ENV}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      - HELMET_ALLOWED_DOMAINS=${HELMET_ALLOWED_DOMAINS}
+      - SWAGGER_ENABLED=${SWAGGER_ENABLED:-false}
+      - METRICS_USER=${METRICS_USER:-prometheus}
+      - JWT_EXPIRES_IN=${JWT_EXPIRES_IN:-15m}
+      - JWT_REFRESH_EXPIRES_IN=${JWT_REFRESH_EXPIRES_IN:-7d}
+      # AUTH_MODE controla si el JwtAuthGuard usa JWT real o el guard temporal.
+      # Valores: 'development' (guard simulado) | 'real' (JWT verificado).
+      # El servidor FALLARÁ al arrancar si NODE_ENV=production y AUTH_MODE≠real.
+      # Ver: backend/src/auth/guards/jwt-auth.guard.ts
+      - AUTH_MODE=${AUTH_MODE:-development}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT_BACKEND:-4000}/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s   # ← Tiempo para que NestJS compile y conecte a BD
+    networks:
+      - app_net      # Reports valida sesión aquí
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: .docker/Dockerfile
+      args:
+        PORT_FRONTEND: ${PORT_FRONTEND:-3000}  # ← Pasa variable al build
+        PNPM_VERSION: ${PNPM_VERSION:-10.32.1}
+    container_name: nombre_del_proyecto_web
+    environment:
+      - PORT_FRONTEND=${PORT_FRONTEND:-3000}
+      - NODE_ENV=${NODE_ENV}
+      # NEXT_PUBLIC_* se bakean en el bundle durante el build de Next.js.
+      # Si cambian, se requiere rebuild completo de la imagen. Ver ADR-002.
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+      - NEXT_PUBLIC_REPORTS_URL=${NEXT_PUBLIC_REPORTS_URL}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT_FRONTEND:-3000}/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s   # ← Next.js standalone tarda más en primer arranque
+    networks:
+      - app_net      # Puede llamar al backend (Server Components)
+
+  reports-api:
+    build:
+      context: ./reports
+      dockerfile: .docker/Dockerfile
+      args:
+        PORT_REPORTS: ${PORT_REPORTS:-5000}  # ← Pasa variable al build
+    container_name: nombre_del_proyecto_reports
+    environment:
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_NAME=${DB_NAME:-nombre_del_proyecto_db}
+      - PORT=${PORT_REPORTS}
+      # APP_ENV controla el modo del stack Python: 'development' | 'production'
+      # Usado por: logging_config.py (formato logs), config.py (is_development),
+      # y main.py (debug mode de Flask). Ver ADR-019.
+      - APP_ENV=${APP_ENV:-development}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT_REPORTS:-5000}/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s   # ← Gunicorn + imports de pandas
+    networks:
+      - app_net      # Valida sesión con backend
+
+# ─── Redes ───────────────────────────────────────────────────────────────────
+networks:
+  # Red publica: solo Nginx (no esta en este compose — es externo)
+  # Red de aplicación interna: comunicación entre servicios
+  app_net:
+    driver: bridge
+    internal: true
+    name: nombre_del_proyecto-app    # Nginx externo se conecta a esta red ADR-011 DECISIONS.md
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24

@@ -1,0 +1,420 @@
+# filepath: docker-compose.prod.yml
+# ══════════════════════════════════════════════════════════════════════════════
+# DOCKER-COMPOSE PRODUCCIÓN — Con Docker Secrets (sin Swarm)
+#
+# CONTROL DE RECURSOS:
+#   Se usa mem_limit / cpus en lugar de deploy.resources.limits
+#   porque deploy.resources solo aplica en Docker Swarm.
+#   En Compose standalone (sin Swarm) se ignora completamente.
+#
+# SECRETOS (sin Swarm):
+#   Los secretos se leen desde ./secrets/*.txt
+#   Ejecutar antes del deploy: make secrets-init && make secrets-check
+#
+# CÓMO FUNCIONA SIN SWARM:
+#   secrets:
+#     db_password:
+#       file: ./secrets/db_password.txt   ← Lee el contenido del archivo
+#
+#   Dentro del contenedor el secreto se monta como archivo en:
+#     /run/secrets/db_password           ← read-only, solo root + proceso
+#
+#   Tu app lee el archivo en lugar de una variable de entorno:
+#     Node.js:  fs.readFileSync('/run/secrets/db_password', 'utf8').trim()
+#     Python:   open('/run/secrets/db_password').read().strip()
+#
+# SETUP PREVIO:
+#   make secrets-init   ← Crea la carpeta secrets/ con los archivos
+#   make secrets-check  ← Verifica que están configurados
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─── Definición de secretos ──────────────────────────────────────────────────
+# Cada secreto apunta a un archivo en ./secrets/ (que está en .gitignore)
+secrets:
+  db_user:
+    file: ./secrets/db_user.txt           # Usuario de la base de datos
+  db_password:
+    file: ./secrets/db_password.txt       # Contraseña de la base de datos
+  db_read_only_user:
+    file: ./secrets/db_read_only_user.txt # Usuario de solo lectura
+  db_read_only_password:
+    file: ./secrets/db_read_only_password.txt # Contraseña de solo lectura
+  metrics_password:
+    file: ./secrets/metrics_password.txt  # Contraseña para métricas (Prometheus)
+  jwt_secret:
+    file: ./secrets/jwt_secret.txt        # Secreto para JWT (usado en AuthModule de NestJS)
+  cookie_secret:
+    file: ./secrets/cookie_secret.txt    # Secreto para cookies seguras (usado en Next.js API routes)
+  pepper_secret:
+    file: ./secrets/pepper_secret.txt    # Secreto adicional para hashing de contraseñas (argon2)
+  redis_secret:
+    file: ./secrets/redis_secret.txt    # Contraseña para Redis (usada en Reports API)
+
+# ─── Servicios ───────────────────────────────────────────────────────────────
+services:
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # BACKEND — NestJS
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  backend:
+    # 1. IDENTIDAD - Imagen con tag reproducible (subir a registry y usar TAG en CI)
+    image: "${IMAGE_BACKEND:-nombre_del_proyecto/backend:${TAG:?TAG es obligatorio en producción}}"
+    build:
+      context: ./backend
+      dockerfile: .docker/Dockerfile.prod
+
+    # 2. POLÍTICA DE ARRANQUE
+    restart: unless-stopped
+    # restart: always
+
+    # 3. RED — Solo accesible via 127.0.0.1, nunca desde internet
+    # sino SOLO a través de Nginx (seguridad).
+    ports:
+      - "127.0.0.1:${PORT_BACKEND}:${PORT_BACKEND}"
+
+    # 4. VARIABLES DE ENTORNO (no sensibles)
+    env_file:
+      - .env.production    # Solo variables no sensibles (NODE_ENV, PORT, URLS públicas)
+    environment:
+      # Indica a la app dónde leer los secretos
+      DB_PASSWORD_FILE: /run/secrets/db_password
+      DB_USER_FILE:     /run/secrets/db_user
+      METRICS_PASSWORD_FILE: /run/secrets/metrics_password
+      # Variables no sensibles también pueden ir aquí directamente
+      # NODE_ENV: production
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      COOKIE_SECRET_FILE: /run/secrets/cookie_secret
+      PEPPER_SECRET_FILE: /run/secrets/pepper_secret
+
+    # 5. SECRETOS — montados como archivos read-only en /run/secrets/
+    secrets:
+      - db_password
+      - db_user
+      - metrics_password
+      - jwt_secret
+      - cookie_secret
+      - pepper_secret
+
+    # 6. HARDENING DEL CONTENEDOR
+    read_only: true
+    # ↑ Todo el filesystem del contenedor es solo lectura.
+    #   Node.js necesita escribir solo en /tmp y /run (ver tmpfs abajo).
+    #   Los Docker Secrets en /run/secrets/ son bind mounts del host —
+    #   NO se ven afectados por read_only: true (se montan por separado).
+    #   Si una librería falla con "Read-only file system", añade su
+    #   directorio al bloque tmpfs. Verifica con:
+    #   docker exec nombre_del_proyecto_api sh -c "touch /ruta/test 2>&1"
+    security_opt:
+      # Evita que procesos dentro del contenedor ganen privilegios (ej. por vulnerabilidades).
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Si necesitas NET_BIND_SERVICE (puerto < 1024), anadir:
+    # cap_add:
+    #   - NET_BIND_SERVICE
+    # Con puertos 4000, 3000, 5000 — NO necesitas cap_add
+    pids_limit: 100       # NestJS + tini: max ~25 en producción (ajustar si usas workers o procesos hijos a 100 para tener margen)
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+    tmpfs:
+      - /tmp:size=64m,mode=1777  # Node puede escribir en /tmp
+      - /run:size=10m,mode=755
+
+    # 7. RECURSOS — limites de CPU y RAM
+    # CONTROL DE RECURSOS REAL (funciona sin Swarm)
+    mem_limit: 1g
+    # Permitir una pequeña cantidad de swap como buffer de emergencia
+    # El swap efectivo es memswap_limit - mem_limit 2500m - 2000m = 500MB de swap
+    memswap_limit: 1500m
+    cpus: "1.0"
+    # deploy.resources.limits se ignora en Compose standalone — usar estos:
+    # deploy:
+    #   resources:
+    #     limits:
+    #       # Evita que un error de código consuma toda la RAM del servidor
+    #       memory: 1G
+    #       # máximo 1 CPU core para backend
+    #       cpus: '1.0'
+
+    # 8. LOGS
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"    # Máximo 10MB por archivo de log
+        max-file: "3"      # Mantener 3 archivos rotados
+
+    # 9. RED
+    networks:
+      - public_net   # Recibe tráfico de Nginx directamente
+      # - app_net      # Definida en docker-compose.yml para compartir con desarrollo
+      - data_net     # Accede a PostgreSQL y Redis
+    extra_hosts:
+      - "host-gateway:host-gateway"  # PostgreSQL en el host (Docker 20.10+ — resuelve a la IP del host)
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # FRONTEND — Next.js
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  frontend:
+    # 1. IDENTIDAD - Imagen con tag reproducible (subir a registry y usar TAG en CI)
+    image: "${IMAGE_FRONTEND:-nombre_del_proyecto/frontend:${TAG:?TAG es obligatorio en producción}}"
+    build:
+      context: ./frontend
+      dockerfile: .docker/Dockerfile.prod
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        NEXT_PUBLIC_REPORTS_URL: ${NEXT_PUBLIC_REPORTS_URL}
+
+    # 2. POLITICA DE ARRANQUE
+    restart: unless-stopped
+    # restart: always
+
+    # 3. RED — Solo accesible via 127.0.0.1, nunca desde internet
+    # sino SOLO a través de Nginx (seguridad).
+    ports:
+      - "127.0.0.1:${PORT_FRONTEND}:${PORT_FRONTEND}"
+
+    # 4. VARIABLES DE ENTORNO (no sensibles)
+    env_file:
+      - .env.production
+    # Frontend no necesita secretos de DB — solo URLs públicas
+    # Si necesitas un API key en el server-side de Next.js, añadir aquí
+
+    # 5. HARDENING DEL CONTENEDOR
+    read_only: true
+    security_opt:
+      # Evita que procesos dentro del contenedor ganen privilegios (ej. por vulnerabilidades).
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Si necesitas NET_BIND_SERVICE (puerto < 1024), anadir:
+    # cap_add:
+    #   - NET_BIND_SERVICE
+    # Con puertos 4000, 3000, 5000 — NO necesitas cap_add
+    pids_limit: 50
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      # ↑ Para Node.js y escrituras temporales genéricas
+
+      # Añadir estas rutas SI Next.js las necesita en runtime:
+      # (Solo añadir las que realmente fallan — no añadir por precaución)
+      # - /app/.next/cache:size=64m,mode=1777
+      # ↑ Caché de Next.js en runtime (raro con standalone, pero posible)
+      # - /app/public:size=16m,mode=1777
+      # ↑ Si Next.js escribe en public/ (normalmente no)
+
+    # 6. RECURSOS — limites de CPU y RAM
+
+    # CONTROL DE RECURSOS REAL (funciona sin Swarm)
+    mem_limit: 512m
+    # Permitir una pequeña cantidad de swap como buffer de emergencia
+    # El swap efectivo es memswap_limit - mem_limit 2500m - 2000m = 500MB de swap
+    memswap_limit: 1024m
+    cpus: "0.5"
+    # deploy.resources.limits se ignora en Compose standalone — usar estos:
+    # deploy:
+    #   resources:
+    #     limits:
+    #       # Evita que un error de código consuma toda la RAM del servidor
+    #       memory: 1G
+    #       # máximo 0.5 CPU core para frontend
+    #       cpus: '0.5'
+
+    # 7. LOGS
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"    # Máximo 10MB por archivo de log
+        max-file: "3"      # Mantener 3 archivos rotados
+
+    # 8. VERIFICACIÓN DE SERVICIO ANTES DE INICIAR
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    # 9. RED
+    networks:
+      - public_net   # Recibe tráfico de Nginx directamente
+      # - app_net      # Definida en docker-compose.yml para compartir con desarrollo
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # REDIS — Caché en memoria
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  redis:
+    image: redis:7.4-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
+    container_name: nombre_del_proyecto_redis
+    restart: unless-stopped
+    volumes:
+    - ./config/redis-entrypoint.sh:/usr/local/bin/redis-entrypoint.sh:ro
+    entrypoint: ["/usr/local/bin/redis-entrypoint.sh"]
+    secrets:
+      - redis_secret
+    healthcheck:
+      # test: ["CMD", "redis-cli", "-a", "$(cat /run/secrets/redis_secret)", "ping"]
+      test: >
+        sh -c "redis-cli --no-auth-warning -a \"$(cat /run/secrets/redis_secret)\" ping > /dev/null 2>&1"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    mem_limit: 128m
+    cpus: "0.25"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    networks:
+      - data_net     # SOLO accesible desde backend y reports
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # REPORTS API — Python/Flask/Gunicorn
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  reports-api:
+    # 1. IDENTIDAD - Imagen con tag reproducible (subir a registry y usar TAG en CI)
+    image: "${IMAGE_REPORTS:-nombre_del_proyecto/reports:${TAG:?TAG es obligatorio en producción}}"
+    build:
+      context: ./reports
+      dockerfile: .docker/Dockerfile.prod
+
+    # 2. POLÍTICA DE ARRANQUE
+    restart: unless-stopped
+    # restart: always
+
+    # 3. RED — Solo accesible via 127.0.0.1, nunca desde internet
+    # sino SOLO a través de Nginx (seguridad).
+    ports:
+      - "127.0.0.1:${PORT_REPORTS}:${PORT_REPORTS}"
+
+    # 4. VARIABLES DE ENTORNO (no sensibles)
+    env_file:
+      - .env.production    # Solo variables no sensibles (NODE_ENV, PORT, URLS públicas)
+    environment:
+      # Indica a la app dónde leer los secretos
+      DB_PASSWORD_FILE: /run/secrets/db_read_only_password
+      DB_USER_FILE:     /run/secrets/db_read_only_user
+      NESTJS_AUTH_URL: ${NESTJS_AUTH_URL:-http://backend:4000}
+      # Para que el deploy falle si no se define AUTH_MODE en .env.production (evita usar un valor por defecto inseguro)
+      AUTH_MODE: ${AUTH_MODE}
+      # Variables no sensibles también pueden ir aquí directamente
+      # APP_ENV: production
+
+    # 5. SECRETOS — montados como archivos read-only en /run/secrets/
+    secrets:
+      - db_read_only_password
+      - db_read_only_user
+      - redis_secret
+
+    # 6. HARDENING DEL CONTENEDOR
+    read_only: true
+    security_opt:
+      # Evita que procesos dentro del contenedor ganen privilegios (ej. por vulnerabilidades).
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Si necesitas NET_BIND_SERVICE (puerto < 1024), anadir:
+    # cap_add:
+    #   - NET_BIND_SERVICE
+    # Con puertos 4000, 3000, 5000 — NO necesitas cap_add
+    pids_limit: 80  # Gunicorn con 4 workers + heartbeats no debería superar esto (Aumentar si reports genera muchos procesos hijos)
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      # ↑ 128MB para archivos temporales de pandas (Excel/CSV intermedios).
+      #   Para datasets >50k filas, considera aumentar a 256m.
+      #   Monitorear con: docker exec nombre_del_proyecto_reports df -h /tmp
+      - /dev/shm:size=64m,mode=1777
+      # ↑ /dev/shm: RAM pura usada por Gunicorn para heartbeats entre master/worker.
+      #   Sin esto, Gunicorn escribe en /tmp (más lento).
+      #   64MB es más que suficiente para 4 workers.
+
+    # 7. RECURSOS — limites de CPU y RAM
+    # CONTROL DE RECURSOS REAL (funciona sin Swarm)
+    mem_limit: 1g
+    # Permitir una pequeña cantidad de swap como buffer de emergencia
+    # El swap efectivo es memswap_limit - mem_limit 2500m - 2000m = 500MB de swap
+    memswap_limit: 1g
+    cpus: "1.5"
+    # deploy.resources.limits se ignora en Compose standalone — usar estos:
+    # deploy:
+    #   resources:
+    #     limits:
+    #       # Python con Pandas/Excel consume más RAM al procesar grandes volúmenes de datos
+    #       memory: 2G
+    #       # máximo 2.0 CPU Pandas/Excel puede saturar CPU en reportes grandes
+    #       cpus: '2.0'
+
+    # 8. LOGS
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"    # 20MB porque reports genera más logs
+        max-file: "5"      # Mantener 5 archivos
+
+    # 9. VERIFICACIÓN DE SERVICIO ANTES DE INICIAR
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+    # 10. RED
+    networks:
+      - public_net   # Recibe tráfico de Nginx
+      # - app_net      # Definida en docker-compose.yml para compartir con desarrollo
+      - data_net     # Accede a PostgreSQL (read-only) y Redis
+    extra_hosts:
+      - "host-gateway:host-gateway"  # PostgreSQL en el host (Docker 20.10+ — resuelve a la IP del host)
+
+
+# ─── Redes ───────────────────────────────────────────────────────────────────
+networks:
+  # Red de entrada pública: Nginx (host) → servicios
+  # NO internal: Nginx necesita DNS externo para OCSP stapling, Let's Encrypt, etc.
+  public_net:
+    driver: bridge
+    internal: false
+    name: nombre_del_proyecto-public
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24  # Rango específico para esta red
+
+  # Red de aplicación interna: comunicación entre servicios
+  # Definido actualmente en docker-compose.yml para compartir con desarrollo
+  # app_net:
+  #   driver: bridge
+  #   internal: true
+  #   name: nombre_del_proyecto-app
+  #   ipam:
+  #     config:
+  #       - subnet: 172.21.0.0/24
+
+  # Red de datos: solo servicios que acceden a DB/Redis
+  data_net:
+    driver: bridge
+    internal: true
+    name: nombre_del_proyecto-data
+    ipam:
+      config:
+        - subnet: 172.22.0.0/24
+# networks:
+#   # Red publica: solo Nginx (no esta en este compose — es externo)
+#   # Red interna: comunicacion entre servicios
+#   nombre_del_proyecto-private:
+#     driver: bridge
+#     internal: true          # Sin acceso a internet — aislada completamente
+#     name: nombre_del_proyecto-private   # Nombre explícito
+
+#   # nombre_del_proyecto-public:
+#   #   driver: bridge
+#   #   name: nombre_del_proyecto-public    # Nginx externo se conecta a esta red ADR-011 DECISIONS.md

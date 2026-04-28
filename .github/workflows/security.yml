@@ -1,0 +1,285 @@
+# filepath: .github/workflows/security.yml
+name: Security & Quality Checks
+
+on:
+  pull_request:
+    branches: [main, develop]  # Corre en cada PR
+  push:
+    branches: [main]
+
+jobs:
+  supply-chain:
+    name: Supply Chain Integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detectar lifecycle scripts en package.json
+        run: |
+          RISKY_SCRIPTS=("preinstall" "install" "postinstall" "prepare")
+          FOUND=0
+          for dir in backend frontend; do
+            for script in "${RISKY_SCRIPTS[@]}"; do
+              if jq -e ".scripts.\"$script\"" "$dir/package.json" > /dev/null 2>&1; then
+                VALUE=$(jq -r ".scripts.\"$script\"" "$dir/package.json")
+                echo "⚠️  $dir/package.json tiene lifecycle script '$script': $value"
+                FOUND=$((FOUND+1))
+              fi
+            done
+          done
+          if [ $FOUND -gt 0 ]; then
+            echo "❌ Se encontraron lifecycle scripts. Revisa si son intencionales."
+            echo "   Si son necesarios, añade su hash a .github/allowed-scripts.txt"
+            exit 1
+          fi
+          echo "✅ Sin lifecycle scripts de riesgo en package.json"
+
+      - name: Detectar curl|bash o wget|sh en scripts
+        run: |
+          if grep -rn "curl.*|.*bash\|wget.*|.*sh\|curl.*|.*sh" \
+            --include="*.sh" --include="Makefile" \
+            --exclude-dir=".git" .; then
+            echo "⚠️  Detectados comandos pipe-to-shell. Revisar manualmente."
+            # No bloquear automáticamente — puede ser legítimo (ej: install.sh de herramientas)
+          fi
+
+      - name: Verificar integridad de herramientas descargadas en CI
+        run: |
+          # Verificar que audit.yml usa checksums para binarios descargados
+          if grep -q "md5sum" .github/workflows/audit.yml; then
+            echo "⚠️  audit.yml usa md5sum para verificar hadolint — md5 es débil."
+            echo "   Cambiar a: sha256sum (ver Hallazgo Adicional A3)"
+          fi
+
+  hadolint:
+    name: Lint Dockerfiles (hadolint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0  # Versión fija, NO @master
+        with:
+          recursive: true         # Escanea todos los Dockerfiles del repo
+          config: .hadolint.yaml  # Usa tu configuración existente
+          failure-threshold: error # Solo falla en errores, warnings son informativos
+
+  trivy:
+    name: Vulnerability Scan (trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Paso 1: Escaneo como tabla en el log (visible al revisar el CI)
+      - name: Trivy scan — table output
+        uses: aquasecurity/trivy-action@0.24.0  # Versión fija
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table   # Muestra resultado legible en el log del CI
+          severity: CRITICAL,HIGH
+          exit-code: '1'   # Falla el paso si hay vulnerabilidades CRITICAL/HIGH (comentar en desarrollo temprano)
+
+      # Paso 2: Escaneo como SARIF + fallo si hay CRITICAL/HIGH
+      - name: Trivy scan — SARIF + fail on CRITICAL/HIGH
+        uses: aquasecurity/trivy-action@0.24.0  # Versión fija
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'   # No falla el paso, ya falló arriba si había CVEs
+
+      # Paso 3: Subir a GitHub Security tab (siempre, incluso si el paso anterior falla)
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        # Solo sube SARIF para repos públicos (GitHub Security no muestra SARIF de repos privados)
+        if: always() && github.event.repository.private == false
+        with:
+          sarif_file: trivy-results.sarif
+
+      # Para repos privados sin Advanced Security: guardar JSON como artefacto
+      - name: Trivy scan — JSON artifact (repos privados)
+        if: github.event.repository.visibility != 'public' && vars.GITHUB_ADVANCED_SECURITY != 'true'
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-results.json
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+
+      - name: Upload Trivy JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report-${{ github.sha }}
+          path: trivy-results.*
+          retention-days: 30
+
+  semgrep:
+    name: SAST — Semgrep
+    runs-on: ubuntu-latest
+    env:
+      # Token gratuito de app.semgrep.dev (cuenta personal, sin costo)
+      # Sin este token, algunos rule packs pueden estar incompletos.
+      # Crear en: https://semgrep.dev/orgs/-/settings/tokens
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    container:
+      image: semgrep/semgrep:1.62.0@sha256:cc869c685dcc0fe497c86258da9f205397d8108e56d21a86082ea4886e52784d
+      # image: returntocorp/semgrep:1.62.0@sha256:7f817a27f8322550e5569750079c10bdecf90284afb660edc5bb27a4b252d928
+    steps:
+      - uses: actions/checkout@v4
+
+      # Escaneo completo — guarda JSON para análisis
+      - name: Semgrep — TypeScript/NestJS (completo)
+        run: |
+          semgrep scan \
+            --config p/typescript \
+            --config p/nodejs \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --error \
+            --json-output semgrep-results.json \
+            backend/src/ || true   # No bloquear aquí — el bloqueo es abajo
+
+      - name: Semgrep — Python (completo)
+        run: |
+          semgrep scan \
+            --config p/python \
+            --config p/flask \
+            --config p/secrets \
+            --error \
+            --json-output semgrep-python.json \
+            reports/ || true
+
+      # ── Verificar severidad y bloquear si hay CRITICAL/HIGH (Comentar en un desarrollo temprano) ─────────
+      - name: Verificar hallazgos críticos (bloquear CI si los hay)
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+
+          results = []
+          for f in ['semgrep-results.json', 'semgrep-python.json']:
+              try:
+                  data = json.load(open(f))
+                  results += data.get('results', [])
+              except Exception as e:
+                  print(f"Advertencia: no se pudo leer {f}: {e}")
+
+          critical = [r for r in results if r.get('extra', {}).get('severity') == 'ERROR']
+          high = [r for r in results if r.get('extra', {}).get('severity') == 'WARNING']
+
+          if critical:
+              print(f"❌ Semgrep: {len(critical)} hallazgo(s) CRITICAL:")
+              for r in critical[:5]:
+                  print(f"  - {r['path']}:{r['start']['line']} — {r['check_id']}")
+              sys.exit(1)
+
+          print(f"✅ Semgrep: sin hallazgos CRITICAL. {len(high)} WARNING(s) registrados.")
+          EOF
+
+      - name: Upload SAST results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-${{ github.sha }}
+          path: semgrep-*.json
+          retention-days: 30
+
+  bandit:
+    name: SAST — Bandit (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install bandit
+
+      # Paso 1: Generar el reporte JSON (no falla aquí — necesitamos el archivo)
+      - name: Bandit scan — generar reporte
+        run: |
+          bandit -r reports/src/ \
+            -ll \
+            -f json \
+            -o bandit-results.json \
+            --exit-zero
+
+      # Paso 2: Bloquear si hay hallazgos HIGH o CRITICAL
+      - name: Verificar hallazgos críticos (bloquear CI)
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+
+          try:
+              data = json.load(open("bandit-results.json"))
+          except Exception as e:
+              print(f"Error leyendo bandit-results.json: {e}")
+              sys.exit(1)
+
+          results = data.get("results", [])
+          # HIGH = bloqueo absoluto; MEDIUM = warning configurable
+          high = [r for r in results if r.get("issue_severity") == "HIGH"]
+          medium = [r for r in results if r.get("issue_severity") == "MEDIUM"]
+
+          if high:
+              print(f"❌ Bandit: {len(high)} hallazgo(s) de severidad HIGH:")
+              for r in high[:5]:
+                  print(f"  - {r['filename']}:{r['line_number']} — {r['test_id']}: {r['issue_text']}")
+              print("\nCorrige estos hallazgos antes de mergear.")
+              sys.exit(1)
+
+          if medium:
+              print(f"⚠️  Bandit: {len(medium)} hallazgo(s) de severidad MEDIUM (no bloquea CI):")
+              for r in medium[:5]:
+                  print(f"  - {r['filename']}:{r['line_number']} — {r['test_id']}: {r['issue_text']}")
+
+          print(f"✅ Bandit: sin hallazgos HIGH. {len(medium)} MEDIUM registrados.")
+          EOF
+
+      # Paso 3: Subir artefacto siempre
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-${{ github.sha }}
+          path: bandit-results.json
+          retention-days: 30
+
+  # ZAP solo corre en PRs hacia main (requiere staging activo)
+  # Para activar: configura STAGING_URL como GitHub Secret del repositorio
+  zap:
+    name: DAST — OWASP ZAP
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && vars.STAGING_URL != ''
+    steps:
+      - uses: actions/checkout@v4
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+          rules_file_name: '.zap/rules.tsv'
+          fail_action: false
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report-${{ github.sha }}
+          path: report_html.html
+          retention-days: 30
+
+  gitleaks:
+    name: Secret Detection (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Necesario para escanear todo el historial
+      
+      - name: Gitleaks — detectar secrets en el repo
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # Solo para repos privados con plan de pago

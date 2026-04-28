@@ -1,0 +1,102 @@
+# filepath: reports/requirements.in
+# Este archivo tiene solo las dependencias directas.
+# pip-compile generará requirements.txt con versiones fijadas + hashes SHA256.
+#
+# Convención de versiones:
+#   >=X.Y.Z  → mínimo requerido por seguridad o compatibilidad de API
+#   ~=X.Y    → compatible con X.Y (acepta X.Y.1, X.Y.2... pero no X.Y+1)
+#   ==X.Y.Z  → versión exacta (solo para dependencias muy sensibles)
+
+# ─── Framework web ────────────────────────────────────────────────────────────
+# flask: Microframework web base para exponer endpoints HTTP
+flask>=3.1.3
+
+# flask-cors: Manejo de CORS para permitir requests desde frontend (ej. Next.js)
+# Permite controlar orígenes, headers y métodos permitidos
+flask-cors>=5.0.0
+
+# types-Flask: Tipos estáticos para Flask (mejora autocompletado y soporte de mypy)
+types-Flask>=1.1.6
+
+# flask-limiter: Rate limiting para proteger endpoints críticos (login, reportes, APIs)
+# Previene abuso, ataques de fuerza bruta y sobrecarga
+flask-limiter>=3.5
+
+# flask-caching: Caching para mejorar rendimiento de endpoints con datos costosos de generar
+# Soporta múltiples backends (Redis, Memcached, etc.) para flexibilidad en producción
+Flask-Caching>=2.3.0
+
+# ─── Cliente HTTP ─────────────────────────────────────────────────────────────
+# requests: Cliente HTTP síncrono simple (usado para integraciones básicas con backend NestJS)
+# Ideal para validación de tokens o llamadas puntuales
+requests>=2.32.3
+
+# httpx: Cliente HTTP moderno con soporte async y pooling
+# Recomendado para alta concurrencia o múltiples requests simultáneos
+httpx>=0.28.0
+
+# ─── Procesamiento de datos ──────────────────────────────────────────────────
+# pandas: Manipulación de datos tabulares (DataFrames)
+# Usado para agregaciones, limpieza y generación de reportes complejos
+pandas>=2.2.3
+
+# ─── Generación de documentos ────────────────────────────────────────────────
+# reportlab: Generación de PDFs de forma programática (reportes, certificados, etc.)
+# Permite control fino del layout y contenido
+reportlab>=4.2.5
+
+# openpyxl: Lectura y escritura de archivos Excel (.xlsx)
+# Usado para exportar reportes o procesar archivos subidos por usuarios
+openpyxl>=3.1.5
+
+# ─── Base de datos ────────────────────────────────────────────────────────────
+# psycopg2-binary: Adaptador PostgreSQL para Python
+# Versión binaria facilita instalación, pero en producción se recomienda psycopg2 compilado
+psycopg2-binary>=2.9.10
+
+# ─── Tipado y calidad de código ──────────────────────────────────────────────
+# mypy: Verificación de tipos estáticos
+# Ayuda a detectar errores antes de runtime y mejora mantenibilidad
+mypy>=1.19.1
+
+# flake8: Linter para validar estilo, errores comunes y consistencia del código
+flake8==7.3.0
+
+# ─── Servidor de producción ──────────────────────────────────────────────────
+# gunicorn: Servidor WSGI para ejecutar Flask en producción
+# Maneja múltiples workers y concurrencia
+gunicorn>=23.0.0
+
+# ─── Validación de configuración ─────────────────────────────────────────────
+# pydantic: Validación de datos basada en modelos (tipos + validación runtime)
+# Usado para schemas y configuración segura
+pydantic>=2.10.0
+
+# pydantic-settings: Extensión para manejar variables de entorno
+# Permite fail-fast si falta configuración crítica
+pydantic-settings>=2.7.1
+
+# ─── Tests ───────────────────────────────────────────────────────────────────
+# pytest: Framework de testing principal
+# Soporta fixtures, parametrización y testing modular
+pytest>=8.3.4
+
+# pytest-cov: Integración de cobertura de código con pytest
+# Permite medir qué tanto del código está siendo testeado
+pytest-cov>=6.0.0
+
+# ─── Logging estructurado ────────────────────────────────────────────────────
+# structlog: Logging estructurado en JSON
+# Ideal para observabilidad (Loki, Grafana, ELK)
+# Facilita correlación de eventos y debugging en producción
+structlog>=25.1.0
+
+# ─── Utilidades ─────────────────────────────────────────────────────────────
+# urllib3: Cliente HTTP de bajo nivel (usado internamente por requests)
+# Se declara explícitamente para control de versiones y seguridad
+urllib3>=2.6.3
+
+# pybreaker: Implementación del patrón Circuit Breaker
+# Protege contra fallos en servicios externos (ej. NestJS, APIs)
+# Evita cascadas de errores y mejora resiliencia del sistema
+pybreaker>=1.2.0

@@ -1,0 +1,181 @@
+# filepath: reports/.docker/Dockerfile.prod
+# ══════════════════════════════════════════════════════════════════════════════
+# REPORTS API - PYTHON/FLASK - PRODUCCIÓN (MULTI-STAGE BUILD)
+# ══════════════════════════════════════════════════════════════════════════════
+# Estrategia: Compilar dependencias en builder, runtime minimalista
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ ETAPA 1: BUILDER                                                         │
+# │ Propósito: Compilar paquetes Python con extensiones C                    │
+# └──────────────────────────────────────────────────────────────────────────┘
+FROM python:3.12-slim@sha256:9e01bf1ae5db7649a236da7be1e94ffbbbdd7a93f867dd0d8d5720d9e1f89fab AS builder
+
+WORKDIR /app
+
+# ─── Variables de entorno Python ──────────────────────────────────────────────
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# ─── Dependencias del sistema (SOLO para build) ───────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # build-essential: Compiladores C/C++ para extensiones Python
+    build-essential \
+    # libpq-dev: Headers de PostgreSQL (necesario para compilar psycopg2)
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Compilación de dependencias Python ───────────────────────────────────────
+COPY requirements.txt .
+# --prefix=/install: Instala en ubicación custom para copiar fácilmente
+# RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+# Resultado: /wheels/*.whl — archivos portables ya compilados
+
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ ETAPA 2: RUNNER (IMAGEN FINAL)                                           │
+# │ Propósito: Solo runtime, sin herramientas de compilación                 │
+# └──────────────────────────────────────────────────────────────────────────┘
+FROM python:3.12-slim@sha256:9e01bf1ae5db7649a236da7be1e94ffbbbdd7a93f867dd0d8d5720d9e1f89fab AS runner
+
+# ─── Metadata de la imagen ───────────────────────────────────────────────────
+# PROYECTO PERSONAL - AJUSTA ESTOS VALORES (ACTUAL UN MIEMBRO DE LA ORGANIZACIÓN)
+# En producción, los labels de imagen aparecen en docker inspect y en registries, lo que puede exponer que se
+# usa esta plantilla base y dar pistas sobre la estructura del proyecto
+# Si quieres ocultar esta información, puedes cambiar el valor de estos labels o eliminarlos por completo
+# (aunque no es recomendable eliminar los labels, ya que son útiles para la gestión de imágenes y contenedores)
+# Completar los labels antes del primer deploy productivo, o generarlos dinámicamente en el CI con variables de entorno
+ARG BUILD_DATE
+ARG GIT_SHA
+ARG PROJECT_NAME=NOMBRE_DEL_PROYECTO
+
+LABEL org.opencontainers.image.title="${PROJECT_NAME} Reports API"
+LABEL org.opencontainers.image.description="Python API for NOMBRE_DEL_PROYECTO platform reports"
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+LABEL org.opencontainers.image.version="${GIT_SHA}"
+LABEL org.opencontainers.image.source="https://github.com/tu-usuario/nombre_del_proyecto"
+LABEL org.opencontainers.image.url="https://github.com/tu-usuario/nombre_del_proyecto"
+LABEL org.opencontainers.image.vendor="NOMBRE_DEL_PROYECTO"
+LABEL org.opencontainers.image.authors="Tu Nombre <tu@email.com>"
+LABEL maintainer="contacto@tudominio.com"
+
+WORKDIR /app
+
+# ─── Variables de entorno (producción) ────────────────────────────────────────
+# APP_ENV=production: Activa optimizaciones de Flask
+# - Desactiva debugger interactivo
+# - Desactiva auto-reload
+# - Habilita caching agresivo
+ENV APP_ENV=production
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# ─── Dependencias del sistema (SOLO runtime) ──────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # libpq5: Librería runtime de PostgreSQL (NO headers -dev, solo runtime)
+    # Nota: psycopg2 fue compilado en builder con libpq-dev, aquí solo necesita libpq5
+    libpq5 \
+    # curl: Healthcheck de Docker
+    curl \
+    # tini: Evita que los procesos zombies se acumulen (recomendada para contenedores con múltiples workers)
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Dependencias Python compiladas ───────────────────────────────────────────
+# Se copian solo los paquetes compilados, no el código fuente ni herramientas
+# COPY --from=builder /install /usr/local
+COPY --from=builder /wheels /wheels
+# ─── Compilación de dependencias Python ───────────────────────────────────────
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir --no-index --find-links /wheels -r requirements.txt \
+    && rm -rf /wheels  # Limpia las wheels tras instalar
+# --no-index: NO busca en PyPI (100% offline)
+# --find-links: busca solo en /wheels
+
+# ─── Usuario no-root ──────────────────────────────────────────────────────────
+# Seguridad: UID 1000 consistente con Node.js para uniformidad
+RUN groupadd -g 1000 nombre_del_proyectogroup && \
+    useradd -r -u 1000 -g nombre_del_proyectogroup -m -s /usr/sbin/nologin nombre_del_proyectouser
+# -r: usuario de sistema (sin login shell por defecto)
+# -s /usr/sbin/nologin: deshabilita shells interactivos
+
+# Copiar código ya con el owner correcto — evita la capa chown
+COPY --chown=nombre_del_proyectouser:nombre_del_proyectogroup . .
+
+ENV HOME=/home/nombre_del_proyectouser
+
+# ─── Puerto expuesto ──────────────────────────────────────────────────────────
+# ARG: Variable de build-time (se pasa desde docker-compose.yml)
+# Valor por defecto si no se pasa build-arg
+ARG PORT_REPORTS=5000
+# ARG → ENV para que persista en runtime y esté disponible para la aplicación
+ENV PORT_REPORTS=${PORT_REPORTS}
+# EXPOSE: Documenta qué puerto usa internamente el contenedor (metadata)
+# Nota: No abre puertos, solo es documentación para docker ps y -P
+EXPOSE ${PORT_REPORTS}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HEALTHCHECK (opcional - actualmente en docker-compose.yml)
+# ══════════════════════════════════════════════════════════════════════════════
+# Usar si necesitas que la imagen sea autocontenida:
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=40s \
+    CMD curl -f http://localhost:${PORT_REPORTS:-5000}/health/ready || exit 1
+
+# ─── Usuario no-root ──────────────────────────────────────────────────────────
+# Seguridad: El proceso corre sin privilegios de root
+USER nombre_del_proyectouser
+
+# ─── tini como ENTRYPOINT ─────────────────────────────────────────────────────
+# entrypoint: tini para manejo correcto de señales (graceful shutdown)
+# tini gestiona señales POSIX correctamente:
+# - SIGTERM se propaga al proceso hijo (graceful shutdown)
+# - Previene procesos zombie
+# - Docker stop funciona en < 10s (sin tini puede tardar 30s de timeout)
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# ─── Comando de inicio (Gunicorn) ─────────────────────────────────────────────
+CMD ["gunicorn", "--config", "/app/gunicorn.conf.py", "main:app"]
+
+# ─── Comando de inicio (Gunicorn) manual  ─────────────────────────────────────────────
+# Configuración de Gunicorn para reportes con Pandas:
+# --config /app/gunicorn.conf.py: 
+# --bind 0.0.0.0:${PORT}: Escucha en todas las interfaces
+# --forwarded-allow-ips=127.0.0.1 : Solo confía en X-Forwarded-For de localhost (Sin esto Flask.request.remote_addr devuelve la IP de Nginx en lugar del cliente real)
+# --workers $(python3 -c 'import os; print(min(os.cpu_count() or 2, 4))'): Número de workers dinámico basado en CPU (máximo 4 para evitar sobrecarga en reportes pesados)
+# ────────────────── Alternativas para el manejo de workers ────────────────────────────────
+# ────────────────  --workers 2 (fijo)
+# ────────────────  --workers $(nproc) (por CPU)
+# ────────────────  --workers $(nproc): 1 worker por CPU core
+# ──────────────────────────────────────────────────────────────────────────────────────────
+# --worker-class gthread: Threads (mejor que sync para I/O + CPU mixto)
+# --threads 4: 4 requests concurrentes por worker
+# --timeout 300: 5 minutos (reportes pesados con miles de filas)
+# --max-requests 200: Reinicia worker cada 200 requests (previene memory leaks de Pandas)
+# --max-requests-jitter 40: Desfasa reinicios (evita que todos coincidan)
+# --worker-tmp-dir /dev/shm: Archivos temporales en RAM (más rápido)
+# --limit-request-line 4094: Límite de longitud de línea de solicitud (ajusta según tus necesidades, 4094 es un valor común 8190 es el máximo HTTP)
+# --limit-request-fields 100: Límite de número de campos de solicitud (ajusta según tus necesidades, 100 es un valor común)
+# --limit-request-field-size 8190: Límite de tamaño de campo de solicitud (ajusta según tus necesidades, 4094 es un valor común 8190 es el máximo HTTP)
+# --preload -: Carga la aplicación antes de forkear workers (mejor para memoria compartida)
+# --access-logfile -: Logs de acceso a stdout (visible en docker logs)
+# --error-logfile -: Logs de error a stdout
+# CMD ["sh", "-c", "exec gunicorn \
+#     --bind 0.0.0.0:${PORT_REPORTS:-5000} \
+#     --forwarded-allow-ips=127.0.0.1 \
+#     --workers $(python3 -c 'import os; print(min(os.cpu_count() or 2, 4))') \
+#     --worker-class gthread \
+#     --threads 4 \
+#     --timeout 300 \
+#     --max-requests 200 \
+#     --max-requests-jitter 40 \
+#     --worker-tmp-dir /dev/shm \
+#     --limit-request-line 4094 \
+#     --limit-request-fields 100 \
+#     --limit-request-field-size 8190 \
+#     --preload \
+#     --access-logfile - \
+#     --error-logfile - \
+#     main:app"]

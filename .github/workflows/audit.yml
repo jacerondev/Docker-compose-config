@@ -1,0 +1,74 @@
+# filepath: .github/workflows/audit.yml
+name: Security Audit Pipeline
+
+on:
+  pull_request:
+    branches: [ "main", "master" ]
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  audit-full:
+    name: Run Make Audit-Full
+    runs-on: ubuntu-24.04
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js (for pnpm audit)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 10
+      
+      - name: Setup Python (for pip-audit)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          
+      # - name: Install Security Tools (Trivy, Syft, Grype, Hadolint)
+      #   run: |
+      #     # Install Trivy
+      #     curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      #     # Install Syft
+      #     curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+      #     # Install Grype
+      #     curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+      #     # Install Hadolint
+      #     wget -qO /usr/local/bin/hadolint https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+      #     chmod +x /usr/local/bin/hadolint
+      - name: Install Trivy
+        uses: aquasecurity/trivy-action@0.24.0   # mismo tag que en security.yml
+
+      - name: Install Syft (SBOM)
+        uses: anchore/sbom-action/install@v0.15.11
+
+      - name: Install Grype
+        uses: anchore/scan-action/install@v4.1.0
+
+      - name: Install Hadolint
+        run: |
+          curl -fsSL https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64 \
+            -o /usr/local/bin/hadolint
+          # Usar SHA256 del release oficial de Hadolint v2.12.0
+          echo "56de29e8909477f9c8b690e853fd347f7b1c428af1e5c5700b38fbf1f15e8f9d  /usr/local/bin/hadolint" | sha256sum -c
+          chmod +x /usr/local/bin/hadolint
+      
+      - name: Make Prepare Audit Dirs
+        run: make prepare-audit-dirs
+        
+      - name: Run Full Security Audit (make audit-full)
+        run: make audit-full NO_COLOR=1
+        
+      - name: Upload Security Reports as Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-reports
+          path: tests/
+          retention-days: 14

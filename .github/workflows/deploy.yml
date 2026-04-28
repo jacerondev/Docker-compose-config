@@ -1,0 +1,128 @@
+# filepath: .github/workflows/deploy.yml
+# ══════════════════════════════════════════════════════════════════════════════
+# Deploy to production — MEJORADO (Punto 14)
+#
+# CAMBIO PRINCIPAL: Secretos NO pasan por variables de entorno del runner.
+# Las credenciales ya están en el servidor en secrets/ desde la configuración
+# inicial (make secrets-init). El deploy solo ejecuta make prod.
+#
+# PREREQUISITO EN EL SERVIDOR (una sola vez):
+#   make secrets-init   ← crea secrets/db_password.txt, db_user.txt, etc.
+#   make secrets-check  ← verifica que están configurados
+#
+# DIFERENCIA con la versión anterior:
+#   Antes: printf 'DB_PASSWORD=%s\n' "$DB_PASSWORD" > .env.deploy
+#          (credenciales viajaban por SSH como variables de entorno)
+#   Ahora: los secretos ya están en el servidor, deploy solo hace git pull + make prod
+# ══════════════════════════════════════════════════════════════════════════════
+name: Deploy to production
+
+on:
+  workflow_run:
+    workflows: ["CI"]          # Nombre exacto del ci.yml (campo "name:")
+    types: [completed]
+    branches: [main]           # Solo deploya desde main, no desde develop
+
+concurrency:                    # ← AÑADIR: solo un deploy a la vez
+  group: production
+  cancel-in-progress: false     # No cancelar un deploy en curso, esperar a que termine
+
+jobs:
+  deploy:
+    # Condición crítica: CI debe haber terminado con éxito
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    environment: production  # Requiere aprobación manual en GitHub
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Verificar que AUTH_MODE es 'real' en producción ─────────────────────
+      - name: Verify AUTH_MODE is 'real' for production
+        run: |
+          AUTH_MODE=$(grep '^AUTH_MODE=' .env.production | cut -d'=' -f2)
+          if [ "$AUTH_MODE" != "real" ]; then
+            echo "ERROR: AUTH_MODE must be 'real' in production!"
+            exit 1
+          fi
+
+      # ── Deploy via SSH ────────────────────────────────────────────────────
+      # SIN envs: — las credenciales NO pasan por el deploy
+      # Los secrets ya están en el servidor desde make secrets-init
+      - name: Deploy via SSH
+        # env:
+        #   TAG: ${{ github.sha }}
+        # run: |
+        #   # Inyectar el SHA como TAG para que docker-compose.prod.yml use la imagen correcta
+        #   # IMAGE_BACKEND=ghcr.io/org/backend:$TAG
+        #   echo "TAG=${TAG}" >> .env.production
+        #   make prod
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # NO hay envs: aquí — los secretos de DB ya están en el servidor
+          script: |
+            set -e
+            cd /opt/nombre_del_proyecto
+
+            EXPECTED_SHA="${{ github.sha }}"
+
+            echo "📥 Verificando integridad del código..."
+            git fetch origin main
+            ACTUAL_SHA=$(git rev-parse origin/main)
+  
+            # Verificar que el SHA coincide con el que disparó el deploy
+            EXPECTED_SHA="${{ github.sha }}"
+
+            if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+              echo "❌ SHA no coincide: esperado $EXPECTED_SHA, actual $ACTUAL_SHA"
+              exit 1
+            fi
+
+            # Verificar firma GPG del commit (si los commits están firmados)
+            git verify-commit "$ACTUAL_SHA" 2>/dev/null || \
+              echo "⚠️  Commit sin firma GPG — configurar GPG en producción"
+
+            # Checkout exacto del SHA verificado
+            git checkout "$EXPECTED_SHA"
+
+            # ── Verificar que Trivy escaneó esta imagen en CI ──────────────
+            # (Solo si tienes el artefacto del SARIF disponible — opcional en primera fase)
+            # TRIVY_REPORT="tests/trivy-backend-${EXPECTED}.sarif"
+            # [ -f "$TRIVY_REPORT" ] || { echo "❌ SBOM/Trivy no encontrado para $EXPECTED"; exit 1; }
+
+            echo "🔐 Verificando secretos..."
+            make secrets-check || {
+              echo "❌ Secretos no configurados. Ejecutar en el servidor: make secrets-init"
+              exit 1
+            }
+
+            echo "🚀 Desplegando con TAG=${EXPECTED_SHA}..."
+            echo "TAG=${EXPECTED_SHA}" >> .env.production
+            make prod
+
+            # ── Verificar que los servicios están healthy ──
+            echo "⏳ Esperando que los servicios estén healthy..."
+            for i in $(seq 1 60); do
+              API=$(docker inspect --format='{{.State.Health.Status}}' nombre_del_proyecto_api 2>/dev/null || echo "missing")
+              WEB=$(docker inspect --format='{{.State.Health.Status}}' nombre_del_proyecto_web 2>/dev/null || echo "missing")
+              RPT=$(docker inspect --format='{{.State.Health.Status}}' nombre_del_proyecto_reports 2>/dev/null || echo "missing")
+              [ "$API" = "healthy" ] && [ "$WEB" = "healthy" ] && [ "$RPT" = "healthy" ] && break
+              echo "  Esperando... ($((i*5))s)"
+              sleep 5
+            done
+            [ "$API" = "healthy" ] || { echo "❌ Timeout"; exit 1; }
+            echo "✅ Deploy completado"
+
+      # ── Notificación de resultado ─────────────────────────────────────────
+      # Opcional: añadir notificación por Slack/email si el deploy falla
+      # - name: Notify on failure
+      #   if: failure()
+      #   uses: rtCamp/action-slack-notify@v2
+      #   env:
+      #     SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      #     SLACK_MESSAGE: "❌ Deploy fallido en ${{ github.ref_name }}"

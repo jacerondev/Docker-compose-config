@@ -1,0 +1,105 @@
+# filepath: monitoring/alerts.yml
+# ══════════════════════════════════════════════════════════════════════════════
+# Reglas de alerta de Prometheus
+#
+# ESTRUCTURA OBLIGATORIA por regla:
+#   labels:            ← Alertmanager usa labels para routing (NO annotations)
+#     severity: critical|warning
+#   annotations:       ← Mensajes legibles para el humano que recibe la alerta
+#     summary: "Mensaje corto → aparece en Slack"
+#
+# FIX: severity estaba al mismo nivel que annotations (incorrecto).
+# Debe estar SIEMPRE dentro de labels: para que el routing de Alertmanager funcione.
+#
+# Recargar sin reiniciar: curl -X POST http://localhost:9090/-/reload
+# ══════════════════════════════════════════════════════════════════════════════
+
+groups:
+  - name: nombre_del_proyecto-infrastructure
+    rules:
+
+      # ── Servicios ─────────────────────────────────────────────────────────
+
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: devops
+        annotations:
+          summary: "Servicio {{ $labels.job }} caido"
+          description: "{{ $labels.instance }} sin responder 1 min. Verificar: make health-check"
+
+      - alert: HealthCheckFailing
+        expr: nestjs_health_check_status == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Healthcheck del backend fallando"
+          description: "El endpoint /health devuelve estado no-ok mas de 2 min. Ver: make logs-backend"
+
+      # ── Recursos ──────────────────────────────────────────────────────────
+
+      - alert: HighCPU
+        expr: (100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 80
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "CPU alta: {{ $value | printf \"%.0f\" }}%"
+          description: "CPU > 80% durante 5 min en {{ $labels.instance }}"
+
+      - alert: LowDiskSpace
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes * 100) < 15
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "Disco al {{ $value | printf \"%.0f\" }}% de capacidad"
+          description: "Menos del 15% libre en {{ $labels.mountpoint }}. Limpiar logs."
+
+      - alert: DiskSpaceCritical
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes * 100) < 5
+        for: 2m
+        labels:
+          severity: critical
+          team: devops
+        annotations:
+          summary: "Disco CRITICO: {{ $value | printf \"%.0f\" }}% libre"
+          description: "Menos del 5% en {{ $labels.mountpoint }}. Accion inmediata."
+
+      # ── Backend NestJS ─────────────────────────────────────────────────────
+
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 3m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Tasa de errores 5xx > 5%: {{ $value | printf \"%.1f\" }}%"
+          description: "Backend con alta tasa de errores. Ver: make logs-backend"
+
+      - alert: SlowResponses
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "P95 de respuesta > 2s: {{ $value | printf \"%.2f\" }}s"
+          description: "Latencia alta — posible sobrecarga de DB o consultas lentas."
+
+      - alert: HighMemoryUsage
+        expr: (container_memory_usage_bytes{name=~"nombre_del_proyecto_.*"} / container_spec_memory_limit_bytes) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "Memoria alta en {{ $labels.name }}: {{ $value | printf \"%.0f\" }}%"
+          description: "Contenedor {{ $labels.name }} usa >85% de su limite. Revisar memory leaks."

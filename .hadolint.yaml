@@ -1,0 +1,49 @@
+# filepath: .hadolint.yaml
+# ══════════════════════════════════════════════════════════════════════════════
+# HADOLINT CONFIGURATION - NOMBRE_DEL_PROYECTO
+# ══════════════════════════════════════════════════════════════════════════════
+# Archivo de configuración para Hadolint (linter de Dockerfiles)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─── Reglas ignoradas (con justificación) ─────────────────────────────────────
+ignored:
+  # DL3006: Always tag the version of an image explicitly
+  # Justificación: Tags como "24-slim" y "3.12-slim" son suficientemente
+  # específicos para nuestro caso. Pinnear a 24.0.0 complicaría el mantenimiento.
+  - DL3006
+  
+  # DL3008: Pin versions in apt-get install
+  # Justificación: Las dependencias del sistema (curl, ca-certificates) son estables.
+  # Queremos recibir patches de seguridad automáticamente.
+  - DL3008
+  
+  # DL3018: Pin versions in apk add
+  # Justificación: No usamos Alpine Linux
+  - DL3018
+  
+  # DL3059: Multiple consecutive RUN instructions
+  # Justificación: A veces necesitamos RUN separados para legibilidad
+  - DL3059
+  
+  # SC2046: Quote this to prevent word splitting
+  # Justificación: Genera falsos positivos en comandos seguros
+  - SC2046
+  
+  # DL3013: Pin versions in pip
+  # Justificación: Usamos requirements.txt con versiones explícitas
+  - DL3013
+  
+  # DL3015: Avoid additional packages by specifying --no-install-recommends
+  # Justificación: Ya lo usamos en todos los apt-get, Hadolint a veces no lo detecta
+  - DL3015
+
+# ─── Trusted registries ──────────────────────────────────────────────────────
+# Solo permitimos imágenes de estos registros
+trustedRegistries:
+  - docker.io       # Docker Hub oficial
+  - gcr.io          # Google Container Registry
+  - ghcr.io         # GitHub Container Registry
+
+# ─── Severidad mínima para fallar el build ───────────────────────────────────
+# Opciones: error, warning, info, style
+failure-threshold: error

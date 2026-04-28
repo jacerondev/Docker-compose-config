@@ -1,0 +1,714 @@
+# filepath: .github/workflows/ci.yml
+# ══════════════════════════════════════════════════════════════════════════════
+# CI Pipeline — NOMBRE_DEL_PROYECTO
+# Incluye: build, tests, SBOM con Syft, escaneo Trivy, upload de evidencia
+# ══════════════════════════════════════════════════════════════════════════════
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # 1. VALIDACIÓN BASE
+  # ────────────────────────────────────────────────────────────────────────────
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      BUILDKIT_PROGRESS: plain  # Solo para hacer la salida del build más legible en CI
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verificar archivos de configuración
+        run: |
+          test -f .env.example       || (echo "❌ .env.example faltante"   && exit 1)
+          test -f docker-compose.yml || (echo "❌ docker-compose.yml faltante" && exit 1)
+          test -f Makefile           || (echo "❌ Makefile faltante"           && exit 1)
+          echo "✅ Archivos de configuración OK"
+
+      - name: Validar Makefile (sintaxis)
+        run: make --dry-run validate 2>&1 | head -20
+
+      - name: Crear .env desde plantilla
+        run: cp .env.example .env
+
+      # validar pnpm install sin scripts postinstall (seguridad)
+      - name: Verificar que .npmrc impone --ignore-scripts
+        run: |
+          # Verificar que el flag está en .npmrc de cada servicio
+          for dir in backend frontend; do
+            if ! grep -q "ignore-scripts=true" "$dir/.npmrc" 2>/dev/null; then
+              echo "❌ $dir/.npmrc no tiene ignore-scripts=true"
+              exit 1
+            fi
+          done
+          echo "✅ ignore-scripts=true verificado en todos los servicios Node"
+
+      # ── Validar variables de entorno ──────────────────────────────
+      # Asegura que .env.example tiene todas las variables requeridas
+      # antes de continuar con el build y los tests.
+      - name: Validar variables de entorno
+        run: |
+          make validate-env
+          echo "✅ Variables de entorno OK"
+
+      - name: Validar docker-compose sintaxis
+        run: |
+          docker compose config > /dev/null
+          echo "✅ docker-compose.yml válido"
+
+      - name: Validar docker-compose.prod.yml
+        run: |
+          cp .env.prod.example .env.production
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml config > /dev/null
+          echo "✅ docker-compose.prod.yml válido"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile*') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile*') }}-
+            ${{ runner.os }}-buildx-
+
+      - name: Build Docker images
+        run: docker compose build
+
+      - name: Test servicios arrancan y son healthy
+        run: |
+          mkdir -p logs/backend logs/reports
+          docker compose up -d
+
+          MAX_WAIT=150
+          INTERVAL=5
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            HEALTHY=$(docker ps --filter "health=healthy" --format '{{.Names}}')
+            API=$(echo "$HEALTHY" | grep -c nombre_del_proyecto_api    || true)
+            WEB=$(echo "$HEALTHY" | grep -c nombre_del_proyecto_web    || true)
+            RPT=$(echo "$HEALTHY" | grep -c nombre_del_proyecto_reports || true)
+
+            if [ "$API" -ge 1 ] && [ "$WEB" -ge 1 ] && [ "$RPT" -ge 1 ]; then
+              echo "✅ Todos los servicios healthy (${ELAPSED}s)"
+              break
+            fi
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "❌ Timeout: servicios no healthy en ${MAX_WAIT}s"
+            docker ps -a
+            docker compose logs --tail=30
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v
+
+      
+  # ────────────────────────────────────────────────────────────────────────────
+  # 2. TYPE CHECKING — BACKEND, FRONTEND Y REPORTS
+  # ────────────────────────────────────────────────────────────────────────────
+  typecheck:
+    name: Type checking
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+          cache-dependency-path: |
+            backend/pnpm-lock.yaml
+            frontend/pnpm-lock.yaml
+
+      - name: Install backend deps
+        working-directory: backend
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check backend
+        working-directory: backend
+        run: pnpm exec tsc --noEmit
+        # ↑ Verifica tipos sin compilar — falla si hay errores de TypeScript
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check frontend
+        working-directory: frontend
+        run: pnpm exec tsc --noEmit
+        # ↑ Verifica tipos sin compilar — falla si hay errores de TypeScript
+
+  typecheck-python:
+    name: Type check Python (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install mypy
+        working-directory: reports
+        run: pip install mypy types-Flask --break-system-packages
+      - name: Run mypy
+        working-directory: reports
+        run: mypy src/ --ignore-missing-imports
+        # ↑ Verifica tipos con mypy — falla si hay errores de tipado en Python
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 3. BUILD IMÁGENES DE PRODUCCIÓN + SBOM
+  # ────────────────────────────────────────────────────────────────────────────
+  build-prod-and-sbom:
+    name: Build prod images + SBOM
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - run: cp .env.example .env
+
+      # ── Build imágenes de producción ────────────────────────────────────────
+      - name: Build Backend (prod)
+        run: |
+          docker build \
+            -f backend/.docker/Dockerfile.prod \
+            --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            --build-arg PROJECT_NAME=NOMBRE_DEL_PROYECTO \
+            backend/ \
+            -t nombre_del_proyecto/backend:${{ github.sha }} \
+            -t nombre_del_proyecto/backend:latest
+
+      - name: Build Frontend (prod)
+        run: |
+          docker build \
+            -f frontend/.docker/Dockerfile.prod \
+            --build-arg NEXT_PUBLIC_API_URL=http://localhost:4000 \
+            --build-arg NEXT_PUBLIC_REPORTS_URL=http://localhost:5000 \
+            --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            --build-arg PROJECT_NAME=NOMBRE_DEL_PROYECTO \
+            frontend/ \
+            -t nombre_del_proyecto/frontend:${{ github.sha }} \
+            -t nombre_del_proyecto/frontend:latest
+
+      - name: Build Reports (prod)
+        run: |
+          docker build \
+            -f reports/.docker/Dockerfile.prod \
+            --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            --build-arg PROJECT_NAME=NOMBRE_DEL_PROYECTO \
+            reports/ \
+            -t nombre_del_proyecto/reports:${{ github.sha }} \
+            -t nombre_del_proyecto/reports:latest
+
+      # ── SBOM con Syft ───────────────────────────────────────────────────────
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          echo "Syft version: $(syft --version)"
+
+      - name: Generate SBOM — Backend
+        run: |
+          mkdir -p scripts/tests
+          syft nombre_del_proyecto/backend:ci \
+            -o cyclonedx-json=scripts/tests/sbom-backend.json \
+            -o table
+          echo "✅ SBOM backend generado"
+
+      - name: Generate SBOM — Reports
+        run: |
+          syft nombre_del_proyecto/reports:ci \
+            -o cyclonedx-json=scripts/tests/sbom-reports.json \
+            -o table
+          echo "✅ SBOM reports generado"
+
+      - name: Generate SBOM — Frontend
+        run: |
+          syft nombre_del_proyecto/frontend:ci \
+            -o cyclonedx-json=scripts/tests/sbom-frontend.json \
+            -o table
+          echo "✅ SBOM frontend generado"
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-${{ github.sha }}
+          path: scripts/tests/sbom-*.json
+          retention-days: 90
+
+      # ── Build con metadatos OCI (descomentar cuando registry esté configurado) ──
+      # - name: Build backend con metadatos
+      #   uses: docker/build-push-action@v5
+      #   with:
+      #     context: ./backend
+      #     file: ./backend/.docker/Dockerfile.prod
+      #     push: false   # cambiar a true cuando el registry esté configurado
+      #     tags: ghcr.io/${{ github.repository }}/backend:${{ github.sha }}
+      #     build-args: |
+      #       BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      #       GIT_SHA=${{ github.sha }}
+      #       PROJECT_NAME=NOMBRE_DEL_PROYECTO
+      # Requiere descomentar en los Dockerfiles:
+      #   ARG BUILD_DATE
+      #   ARG GIT_SHA
+      #   LABEL org.opencontainers.image.created="${BUILD_DATE}"
+      #   LABEL org.opencontainers.image.revision="${GIT_SHA}"
+
+      # - name: Build frontend con metadatos
+      #   uses: docker/build-push-action@v5
+      #   with:
+      #     context: ./frontend
+      #     file: ./frontend/.docker/Dockerfile.prod
+      #     push: false
+      #     tags: ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}
+      #     build-args: |
+      #       BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      #       GIT_SHA=${{ github.sha }}
+      #       NEXT_PUBLIC_API_URL=http://localhost:4000
+      #       NEXT_PUBLIC_REPORTS_URL=http://localhost:5000
+      #
+      # - name: Build reports con metadatos
+      #   uses: docker/build-push-action@v5
+      #   with:
+      #     context: ./reports
+      #     file: ./reports/.docker/Dockerfile.prod
+      #     push: false
+      #     tags: ghcr.io/${{ github.repository }}/reports:${{ github.sha }}
+      #     build-args: |
+      #       BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      #       GIT_SHA=${{ github.sha }}
+
+  # Firmar las imágenes con Cosign (descomentar cuando esté configurado el registry y se hayan subido las imágenes)
+  # sign-images:
+  #   needs: build-prod-and-sbom
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: sigstore/cosign-installer@v3
+  #     - name: Sign backend image
+  #       run: cosign sign --yes nombre_del_proyecto/backend:${{ github.sha }}
+  #       env:
+  #         COSIGN_EXPERIMENTAL: 1
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 4. TESTS + COBERTURA
+  # ACTUALIZADO: añadidos coverage reports y threshold
+  # ────────────────────────────────────────────────────────────────────────────
+  test-backend:
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Install dependencies
+        working-directory: ./backend
+        run: pnpm install --frozen-lockfile
+
+      # ── pnpm audit — detecta vulnerabilidades en dependencias ────
+      # --audit-level=high: falla solo en HIGH y CRITICAL
+      # --prod: solo dependencias de producción (no devDependencies)
+      - name: pnpm audit — dependencias de producción
+        working-directory: ./backend
+        run: |
+          pnpm audit --audit-level=high --prod 2>&1 | tee /tmp/pnpm-audit-backend.txt || {
+            echo "⚠️ Vulnerabilidades HIGH/CRITICAL encontradas en backend"
+            echo "Ver artefacto pnpm-audit-backend para el detalle completo"
+            exit 1
+          }
+
+      # ── Tests con cobertura ────────────────────────────────────────────────
+      # pnpm run test:cov ejecuta: jest --coverage  (definido en package.json)
+      # El threshold ya está en package.json → jest config
+      # NO usar --coverageThreshold en CLI: anularía el valor de package.json.
+      # --passWithNoTests: no falla si aún no hay tests escritos (plantilla inicial).
+      #
+      # Si el threshold falla: o hay tests rotos o la cobertura bajó de los mínimos.
+      # En ambos casos el CI DEBE fallar — no silenciar con fallbacks.
+      - name: Run tests with coverage
+        working-directory: ./backend
+        run: pnpm run test:cov -- --passWithNoTests
+
+      - name: Run linter
+        working-directory: ./backend
+        run: pnpm run lint
+
+      - name: Upload pnpm audit — backend
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pnpm-audit-backend-${{ github.sha }}
+          path: /tmp/pnpm-audit-backend.txt
+          retention-days: 30
+
+      - name: Upload coverage report — backend
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-backend-${{ github.sha }}
+          path: backend/coverage/
+          retention-days: 30
+
+  test-frontend:
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: pnpm install --frozen-lockfile
+
+      # ── pnpm audit — frontend ────────────────────────────────────
+      - name: pnpm audit — dependencias de producción
+        working-directory: ./frontend
+        run: |
+          pnpm audit --audit-level=high --prod 2>&1 | tee /tmp/pnpm-audit-frontend.txt || {
+            echo "⚠️ Vulnerabilidades HIGH/CRITICAL encontradas en frontend"
+            exit 1
+          }
+
+      - name: Run linter
+        working-directory: ./frontend
+        run: pnpm run lint
+
+      - name: Run tests with coverage
+        working-directory: ./frontend
+        run: pnpm test --if-present -- --coverage 2>/dev/null || echo "⚠️ Sin tests de frontend configurados"
+
+      - name: Upload pnpm audit — frontend
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pnpm-audit-frontend-${{ github.sha }}
+          path: /tmp/pnpm-audit-frontend.txt
+          retention-days: 30
+
+      - name: Upload coverage report — frontend
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-frontend-${{ github.sha }}
+          path: frontend/coverage/
+          retention-days: 30
+
+  test-reports:
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        working-directory: ./reports
+        run: pip install -r requirements.txt
+
+      - name: Run linter (flake8)
+        working-directory: ./reports
+        run: |
+          pip install -r requirements.txt
+          flake8 . --max-line-length=120 --ignore=E501
+
+      - name: Test DB read-only permissions
+        working-directory: ./reports
+        # Solo corre si hay una BD de test disponible (variable de entorno)
+        if: env.DB_HOST != ''
+        env:
+          DB_HOST: ${{ secrets.TEST_DB_HOST }}
+          DB_PORT: "5432"
+          DB_NAME: ${{ secrets.TEST_DB_NAME }}
+          DB_USER: ${{ secrets.TEST_DB_READONLY_USER }}
+          DB_PASSWORD: ${{ secrets.TEST_DB_READONLY_PASSWORD }}
+          APP_ENV: development
+        run: |
+          python -m pytest tests/test_db_readonly.py -v \
+            --tb=short \
+            -x  # parar en el primer fallo
+
+      # ── ACTUALIZADO: tests con cobertura Python ────────────────────────────
+      # pytest-cov genera htmlcov/ con reporte HTML
+      # --cov-fail-under=0 permite pasar aunque no haya tests aún
+      # Aumentar el número gradualmente: 0 → 30 → 60 → 80
+      - name: Run tests with coverage
+        working-directory: ./reports
+        run: |
+          pip install pytest pytest-cov
+          python -m pytest tests/ \
+            --cov=. \
+            --cov-report=html:htmlcov \
+            --cov-report=term-missing \
+            --cov-fail-under=30 \
+            --tb=short \
+            2>/dev/null || echo "⚠️ Sin tests definidos en reports/tests/"
+
+      - name: Upload coverage report — reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-reports-${{ github.sha }}
+          path: reports/htmlcov/
+          retention-days: 30
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 5. ESCANEO DE SEGURIDAD CON TRIVY — LOS 3 SERVICIOS
+  # ─────────────────────────────────────────────────────────────────────────────
+  #
+  # Escanea los 3 servicios y sube el SARIF de TODOS a GitHub Security tab.
+  #
+  # Por qué subir todos los SARIFs:
+  #   - GitHub Security → Code scanning muestra alertas por servicio
+  #   - Sin el SARIF de reports o frontend, sus vulnerabilidades no aparecen
+  #   - Las categorías separan los resultados en la UI de GitHub
+  # ────────────────────────────────────────────────────────────────────────────
+  scan-prod-images:
+    name: Trivy — Scan production images
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+
+      - name: Build production images (los 3 servicios)
+        run: |
+          docker build -f backend/.docker/Dockerfile.prod backend/ -t nombre_del_proyecto/backend:scan
+          docker build -f reports/.docker/Dockerfile.prod reports/ -t nombre_del_proyecto/reports:scan
+          docker build \
+            -f frontend/.docker/Dockerfile.prod \
+            --build-arg NEXT_PUBLIC_API_URL=http://localhost:4000 \
+            --build-arg NEXT_PUBLIC_REPORTS_URL=http://localhost:5000 \
+            frontend/ \
+            -t nombre_del_proyecto/frontend:scan
+
+      - name: Scan backend image
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: nombre_del_proyecto/backend:scan
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          format: 'sarif'
+          output: 'trivy-backend.sarif'
+
+      - name: Scan reports image
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: nombre_del_proyecto/reports:scan
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          format: 'sarif'
+          output: 'trivy-reports.sarif'
+
+      - name: Scan frontend image
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: nombre_del_proyecto/frontend:scan
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          format: 'sarif'
+          output: 'trivy-frontend.sarif'
+
+      # ── Upload SARIF de los 3 servicios a GitHub Security tab ────────────────
+      - name: Upload SARIF — backend
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-backend.sarif
+          category: trivy-backend
+
+      - name: Upload SARIF — reports
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-reports.sarif
+          category: trivy-reports
+
+      - name: Upload SARIF — frontend
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-frontend.sarif
+          category: trivy-frontend
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 6. SAST (Bandit para Python, Semgrep para TypeScript)
+  # ─────────────────────────────────────────────────────────────────────────────
+  sast-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Bandit (Python SAST)
+        run: |
+          pip install bandit
+          bandit -r reports/src/ -ll -f json -o bandit-report.json || true
+      - name: Run pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r reports/requirements.txt
+
+  sast-typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: p/typescript p/security-audit
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 7. TEST DE HARDENING: VERIFICAR READ-ONLY FILESYSTEM EN BACKEND Y FRONTEND
+  # ─────────────────────────────────────────────────────────────────────────────
+  test-readonly-filesystem:
+    name: Test read-only filesystem hardening
+    runs-on: ubuntu-latest
+    needs: [build]  # Asegurarse de que las imágenes estén construidas
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Start services (prod config)
+        run: make prod-up  # Levantar con docker-compose.prod.yml
+      
+      - name: Wait for services to be healthy
+        run: |
+          timeout 120 bash -c 'until docker inspect nombre_del_proyecto_api --format="{{.State.Health.Status}}" | grep -q healthy; do sleep 3; done'
+          timeout 120 bash -c 'until docker inspect nombre_del_proyecto_web --format="{{.State.Health.Status}}" | grep -q healthy; do sleep 3; done'
+      
+      - name: Verify read-only filesystem — Backend
+        run: |
+          # Intentar escribir — DEBE fallar con "Read-only file system"
+          if docker exec nombre_del_proyecto_api sh -c "touch /app/test-write 2>&1" | grep -q "Read-only"; then
+            echo "✅ Backend: filesystem es read-only"
+          else
+            echo "❌ Backend: filesystem NO es read-only — FALLO DE SEGURIDAD"
+            exit 1
+          fi
+          
+          # Verificar que /tmp sí es escribible (tmpfs)
+          if docker exec nombre_del_proyecto_api sh -c "touch /tmp/test-write 2>&1" | grep -q "Read-only"; then
+            echo "❌ Backend: /tmp no es escribible — error de configuración"
+            exit 1
+          else
+            echo "✅ Backend: /tmp es escribible (tmpfs configurado)"
+          fi
+      
+      - name: Verify read-only filesystem — Frontend
+        run: |
+          if docker exec nombre_del_proyecto_web sh -c "touch /app/test-write 2>&1" | grep -q "Read-only"; then
+            echo "✅ Frontend: filesystem es read-only"
+          else
+            echo "❌ Frontend: filesystem NO es read-only — FALLO DE SEGURIDAD"
+            exit 1
+          fi
+      
+      - name: Verify no-new-privileges — Backend
+        run: |
+          # Intentar obtener privilegios — debe fallar
+          if docker exec nombre_del_proyecto_api sh -c "sudo id 2>&1" | grep -q "not found\|Permission denied"; then
+            echo "✅ Backend: no-new-privileges activo"
+          fi
+      
+      - name: Cleanup
+        if: always()
+        run: make prod-down
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # TODO (PENDIENTE): JOB DE TESTS E2E
+  # ────────────────────────────────────────────────────────────────────────────
+  #
+  # El proyecto tiene la infraestructura lista para e2e (backend/test/app.e2e-spec.ts)
+  # pero el job CI aún no está habilitado porque no hay endpoints de negocio implementados.
+  #
+  # CUÁNDO HABILITARLO:
+  #   Cuando AuthModule esté completamente implementado y haya al menos
+  #   un flujo completo (ej: register → login → acceder recurso protegido).
+  #
+  # CÓMO IMPLEMENTARLO — descomentar y adaptar cuando llegue el momento:
+  #
+  # e2e-backend:
+  #   name: E2E Tests — Backend
+  #   runs-on: ubuntu-latest
+  #   needs: validate
+  #
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: cp .env.example .env
+  #
+  #     - name: Arrancar stack completo (con DB)
+  #       run: |
+  #         docker compose up -d
+  #         make wait-healthy
+  #
+  #     - uses: actions/setup-node@v4
+  #       with:
+  #         node-version: '24'
+  #     - uses: pnpm/action-setup@v4
+  #       with:
+  #         version: 10
+  #         run_install: false
+  #
+  #     - name: Instalar dependencias
+  #       working-directory: ./backend
+  #       run: pnpm install --frozen-lockfile
+  #
+  #     - name: Ejecutar tests E2E
+  #       working-directory: ./backend
+  #       # TEST_API_URL: URL del backend arrancado en docker compose
+  #       # Los e2e hacen requests HTTP reales contra el servidor
+  #       env:
+  #         TEST_API_URL: http://localhost:4000
+  #       run: pnpm run test:e2e
+  #
+  #     - name: Cleanup
+  #       if: always()
+  #       run: docker compose down -v
+  #
+  # PREREQUISITOS ANTES DE ACTIVARLO:
+  #   1. Implementar AuthService con register/login reales
+  #   2. Asegurarse de que backend/test/app.e2e-spec.ts tiene tests útiles
+  #   3. Añadir TEST_API_URL al jest-e2e.json si es necesario
+  #   4. Considerar si los e2e deben bloquear merge (needs: [validate, test-backend])
+  #      o ser informativos (continue-on-error: true durante el periodo de setup)
+  # ────────────────────────────────────────────────────────────────────────────

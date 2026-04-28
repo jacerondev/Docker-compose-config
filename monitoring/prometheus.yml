@@ -1,0 +1,73 @@
+# filepath: (monitoring/prometheus.yml)
+# ══════════════════════════════════════════════════════════════════════════════
+# Configuración de Prometheus para NOMBRE_DEL_PROYECTO
+#
+# Cómo funciona:
+#   Prometheus "scrapea" (pregunta) cada servicio cada 30s
+#   Cada servicio debe exponer GET /metrics en formato Prometheus
+#   Los datos se guardan en prometheus_data volume (30 días)
+#
+# PREREQUISITO: Los servicios deben exponer /metrics
+#   Backend NestJS: pnpm install @willsoto/nestjs-prometheus prom-client
+#   Reports Flask:  pip install prometheus-client
+# ══════════════════════════════════════════════════════════════════════════════
+
+global:
+  scrape_interval: 30s      # preguntar métricas cada 30s
+  evaluation_interval: 30s  # evaluar alertas cada 30s
+  scrape_timeout: 10s        # timeout por scrape
+
+# ── Reglas de alerta ──────────────────────────────────────────────────────────
+# Prometheus evalúa estas reglas y envía alertas a Alertmanager
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# ── Alertmanager ──────────────────────────────────────────────────────────────
+# Solo activo en producción (ver docker-compose.monitoring.yml profiles)
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+# ── Jobs de scraping ──────────────────────────────────────────────────────────
+scrape_configs:
+
+  # Prometheus se monitorea a sí mismo
+  - job_name: 'prometheus'
+    static_configs:
+      # NOTA: Estos puertos deben coincidir con .env
+      - targets: ['localhost:9090']     # Puerto prometheus quemado
+
+  # Backend NestJS
+  # PREREQUISITO: pnpm install @willsoto/nestjs-prometheus prom-client
+  # Ver docs/IMPORTANTE-NESTJS para el código
+  - job_name: 'nombre_del_proyecto-backend'
+    static_configs:
+      # NOTA: Estos puertos deben coincidir con .env
+      - targets: ['host-gateway:4000']  # Puerto backend quemado
+    metrics_path: /metrics
+    # Si el backend requiere autenticación:
+    basic_auth:
+      username: prometheus
+      password: CAMBIAR_genera_con_openssl_rand_base64_24
+
+  # Reports API Flask
+  # PREREQUISITO: pip install prometheus-client (añadir a requirements.in)
+  - job_name: 'nombre_del_proyecto-reports'
+    static_configs:
+      # NOTA: Estos puertos deben coincidir con .env
+      - targets: ['host-gateway:5000']  # Puerto reports quemado
+    metrics_path: /metrics
+
+  # Servidor host: CPU, RAM, disco, red
+  - job_name: 'node-exporter'
+    static_configs:
+      # NOTA: Estos puertos deben coincidir con .env
+      - targets: ['node-exporter:9100'] # Puerto node-exporter quemado
+
+  # Contenedores Docker: métricas por contenedor
+  - job_name: 'cadvisor'
+    static_configs:
+      # NOTA: Estos puertos deben coincidir con .env
+      - targets: ['cadvisor:8080']
+    metrics_path: /metrics
